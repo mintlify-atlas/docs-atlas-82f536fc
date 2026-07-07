@@ -1,5 +1,5 @@
 ---
-title: "Patch Analysis: Fixing the Role-Mismatch in kvm_mmu_get_child_sp"
+title: "Januscape Patch: Role-Mismatch Fix in KVM Shadow MMU"
 sidebarTitle: "The Fix"
 description: "Commit 81ccda30b4e8 adds a role.word comparison to kvm_mmu_get_child_sp, ensuring shadow pages are reused only when both gfn and role match."
 ---
@@ -48,7 +48,7 @@ index 9368a71336fe4..c13b80fe3125b 100644
 
 ## What Changed
 
-The diff is small — four added lines and three removed — but each change is load-bearing.
+The diff is small — six added lines and four removed — but each change is load-bearing.
 
 **1. `role` is computed before the reuse check (was computed after)**
 
@@ -102,16 +102,12 @@ By gating reuse on a full role match, the patch prevents a direct-split page fro
 
 ## Patching Guidance
 
-Apply commit `81ccda30b4e8` to your host kernel, or upgrade to a kernel version that already includes it (merged 2026-06-19). To verify that a running kernel contains the fix, check the kernel commit log or inspect the build configuration:
+Apply commit `81ccda30b4e8` to your host kernel, or upgrade to a kernel version that already includes it (merged 2026-06-19). To verify that a running kernel's source tree contains the fix, check the git commit log:
 
 ```bash
 # Check whether the commit is present in the running kernel's source tree
-grep -r "81ccda30b4e8" /boot/config-$(uname -r) 2>/dev/null || \
-  git -C /usr/src/linux log --oneline | grep 81ccda30b4e8
+git -C /usr/src/linux log --oneline | grep 81ccda30b4e8
 ```
 
-Distribution kernels (RHEL, Debian, Ubuntu, SUSE) that backport the fix will include `81ccda30b4e8` in their changelog or patch series. Confirm with your distro's security advisory tracker.
+Distribution kernels (RHEL, Debian, Ubuntu, SUSE) that backport the fix will include `81ccda30b4e8` in their changelog or patch series.
 
-<Tip>
-  If patching the host kernel is not immediately possible, disabling nested virtualization exposure to untrusted guests is an effective temporary workaround. On KVM/Intel, set `kvm-intel.nested=0`; on KVM/AMD, set `kvm-amd.nested=0`. This prevents L1 guests from running nested guests (L2), which is the prerequisite for reaching the shadow-MMU fetch path where the bug fires. Remove the mitigation once the patched kernel is deployed.
-</Tip>

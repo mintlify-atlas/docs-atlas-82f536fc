@@ -107,11 +107,11 @@ The behavior at `[8]` depends on kernel configuration:
 
 | Kernel config | `panic_on_oops` | Outcome |
 |---|---|---|
-| `CONFIG_BUG_ON_DATA_CORRUPTION=y` | any | `BUG_ON` → immediate host kernel panic |
+| `CONFIG_BUG_ON_DATA_CORRUPTION=y` | set | `BUG_ON` → immediate host kernel panic |
 | `CONFIG_BUG_ON_DATA_CORRUPTION=n` | — | `WARN_ON_ONCE` + `kvm_vm_bugged()` — guest VM is killed, host survives |
 
 <Warning>
-`CONFIG_BUG_ON_DATA_CORRUPTION=y` is the **default in RHEL** and many other enterprise distributions. Combined with the default `panic_on_oops=1`, a single successful race triggers an immediate, unrecoverable host kernel panic. Every guest on the physical host is simultaneously brought down.
+`CONFIG_BUG_ON_DATA_CORRUPTION=y` is the **default in RHEL** and many other enterprise distributions. Combined with `panic_on_oops`, a single successful race triggers an immediate, unrecoverable host kernel panic — bringing down every guest on the physical host simultaneously.
 </Warning>
 
 ## Observed Panic Log
@@ -140,10 +140,10 @@ The public PoC is a kernel module loaded inside the guest VM. It requires nested
 
 ```bash
 # Intel
-sudo rmmod kvm_intel; sudo insmod poc.ko
+rmmod kvm_intel; insmod poc.ko
 
 # AMD
-sudo rmmod kvm_amd; sudo insmod poc.ko amd=1
+rmmod kvm_amd; insmod poc.ko amd=1
 ```
 
 The module launches one writer kthread and up to seven faulter kthreads (configurable via `nvcpu=`). The writer toggles `nest_pd[PDE_IDX]` between a huge-page PTE and a table PTE. The faulters continuously run L2, generating faults that drive the shadow MMU fetch path. The race window opens between the PDE write and the subsequent `kvm_page_track_write` zap on L0. With the default `dwell=256` spin count, the module reports progress periodically and the panic typically occurs within seconds to minutes on a vulnerable host.

@@ -1,7 +1,7 @@
 ---
-title: "Use-After-Free Write Primitive in KVM Shadow MMU"
+title: "Use-After-Free Write in KVM Shadow MMU (Januscape)"
 sidebarTitle: "UAF Write"
-description: "Role confusion in Januscape breaks shadow page lifetime accounting, creating a use-after-free where a freed shadow page's backing memory receives a fixed constant write."
+description: "Januscape role confusion breaks shadow page lifetime and parent pointer accounting, creating a use-after-free write primitive with a fixed value."
 ---
 
 When the role-mismatch reuse described in the root cause fires, the shadow MMU begins using a `direct=1` shadow page as if it were `direct=0`. This confusion does not immediately crash the kernel — it propagates silently through parent pointer accounting until the shadow page is eventually zapped. At that point, the cleanup path writes a fixed constant into a memory location that may have already been freed and reallocated as a different kernel object. This is the Januscape use-after-free write primitive.

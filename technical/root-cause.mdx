@@ -1,7 +1,7 @@
 ---
 title: "Root Cause: Role-Mismatch Shadow Page Reuse in KVM"
 sidebarTitle: "Root Cause"
-description: "kvm_mmu_get_child_sp() compared only gfn when deciding to reuse a child shadow page, ignoring role.direct. This is the root cause of Januscape (CVE-2026-53359)."
+description: "kvm_mmu_get_child_sp() reused child shadow pages by gfn alone, ignoring role.direct — the one-field omission at the root of Januscape CVE-2026-53359."
 ---
 
 The root cause of Januscape is a one-field omission in a single reuse guard inside `kvm_mmu_get_child_sp()`. The function decides whether to reuse an already-linked child shadow page based solely on the guest frame number, without verifying that the existing page's role matches what the caller is requesting. When a direct-split shadow page (`role.direct=1`) and an indirect shadow page (`role.direct=0`) are both needed for the same gfn — a situation that arises naturally in the shadow MMU fetch path — the guard fires prematurely, returning the wrong-role page as if it were valid. Everything downstream breaks from that point forward.
@@ -94,14 +94,25 @@ With `nvcpu=8` faulter threads contending over `mmu_lock`, they delay the writer
 Patch `81ccda30b4e8` adds a `role.word` comparison to the reuse guard, so that an existing child page is reused only when both the gfn **and** the role match:
 
 ```diff
--   if (is_shadow_present_pte(*sptep) && !is_large_pte(*sptep) &&
--       spte_to_child_sp(*sptep) && spte_to_child_sp(*sptep)->gfn == gfn)
-+   if (is_shadow_present_pte(*sptep) &&
-+       !is_large_pte(*sptep) &&
-+       spte_to_child_sp(*sptep) &&
-+       spte_to_child_sp(*sptep)->gfn == gfn &&
-+       spte_to_child_sp(*sptep)->role.word == role.word)
-        return ERR_PTR(-EEXIST);
+ static struct kvm_mmu_page *kvm_mmu_get_child_sp(struct kvm_vcpu *vcpu,
+ 					 u64 *sptep, gfn_t gfn,
+ 					 bool direct, unsigned int access)
+ {
+-	union kvm_mmu_page_role role;
++	union kvm_mmu_page_role role = kvm_mmu_child_role(sptep, direct, access);
+ 
+-	if (is_shadow_present_pte(*sptep) && !is_large_pte(*sptep) &&
+-	    spte_to_child_sp(*sptep) && spte_to_child_sp(*sptep)->gfn == gfn)
++	if (is_shadow_present_pte(*sptep) &&
++	    !is_large_pte(*sptep) &&
++	    spte_to_child_sp(*sptep) &&
++	    spte_to_child_sp(*sptep)->gfn == gfn &&
++	    spte_to_child_sp(*sptep)->role.word == role.word)
+ 		return ERR_PTR(-EEXIST);
+ 
+-	role = kvm_mmu_child_role(sptep, direct, access);
+ 	return kvm_mmu_get_shadow_page(vcpu, gfn, role);
+ }
 ```
 
 The patch also moves the `kvm_mmu_child_role()` call before the guard, so the role is available for comparison without restructuring the control flow. With this change, a request for `direct=0` on a gfn that already has a `direct=1` page linked at `sptep` will not match the guard, and `kvm_mmu_get_shadow_page()` will be called to create or fetch the correctly-typed shadow page.

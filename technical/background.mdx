@@ -1,7 +1,7 @@
 ---
 title: "KVM Shadow MMU and Nested Virtualization Background"
 sidebarTitle: "Background"
-description: "Explains KVM x86 shadow paging, two-stage address translation, nested virtualization, and rmap reverse mapping — the foundation for understanding Januscape."
+description: "KVM x86 shadow paging, nested virtualization, shadow page roles, and rmap — the foundation for understanding Januscape (CVE-2026-53359)."
 ---
 
 KVM translates guest virtual addresses to host physical addresses through two fundamentally different mechanisms. Understanding which mechanism is active — and why nested virtualization forces a switch to the legacy software path — is essential to understanding where Januscape lives and why it is triggerable on both Intel and AMD hosts despite being pure in-kernel KVM code.

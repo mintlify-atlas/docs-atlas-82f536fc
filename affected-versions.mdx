@@ -1,5 +1,5 @@
 ---
-title: "Affected Linux Kernel Versions for CVE-2026-53359"
+title: "Januscape CVE-2026-53359: Affected Linux Kernel Versions"
 sidebarTitle: "Affected Versions"
 description: "CVE-2026-53359 affects Linux kernels from commit 2032a93d66fa (2010) through 81ccda30b4e8 (2026). Check and apply the patch immediately."
 ---
@@ -17,7 +17,7 @@ CVE-2026-53359 (Januscape) affects every Linux kernel that contains the vulnerab
 | **Introduced** | [`2032a93d66fa`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=2032a93d66fa) | 2010-08-01 | Nested virtualization infrastructure added `kvm_mmu_get_child_sp()` without a role check |
 | **Fixed** | [`81ccda30b4e8`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=81ccda30b4e8) | 2026-06-16 (authored) · 2026-06-19 (merged) | Added `role.word` comparison to the child SP reuse condition |
 
-Every mainline kernel in the range **v2.6.36 through the commit immediately preceding `81ccda30b4e8`** is vulnerable. This includes all stable and longterm branches that backport the nested KVM shadow MMU code but have not yet received the fix backport.
+Every mainline kernel in the range from commit `2032a93d66fa` (2010-08-01) through the commit immediately preceding `81ccda30b4e8` is vulnerable. This includes all stable and longterm branches that backport the nested KVM shadow MMU code but have not yet received the fix backport.
 
 ## How to Check Whether Your Kernel Is Patched
 
@@ -90,7 +90,7 @@ Distribution vendors began backporting the fix after the embargo ended on 2026-0
 ## Disclosure Timeline Reference
 
 - **2026-06-12** — Vulnerability and exploit submitted to `security@kernel.org` by Hyunwoo Kim
-- **2026-06-13** — KVM maintainers Paolo Bonzini and Sean Christopherson engaged; Paolo authored the patch
+- **2026-06-13** — KVM maintainers Paolo and Sean engaged; Paolo authored the patch
 - **2026-06-17** — Patch posted to [lore.kernel.org](https://lore.kernel.org/all/20260617134425.440091-1-pbonzini@redhat.com/) for pre-merge testing
 - **2026-06-19** — `81ccda30b4e8` merged into Linus's mainline tree
 - **2026-07-01** — Submitted to `linux-distros@vs.openwall.org`; 5-day embargo set

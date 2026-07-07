@@ -1,10 +1,10 @@
 ---
-title: "Januscape: KVM Guest-to-Host Escape Vulnerability"
+title: "Januscape: KVM/x86 Guest-to-Host Escape Vulnerability"
 sidebarTitle: "Introduction"
 description: "Januscape (CVE-2026-53359) is a use-after-free in KVM/x86 shadow MMU allowing a guest VM to panic or escape to the host on Intel and AMD."
 ---
 
-Januscape (CVE-2026-53359) is a use-after-free vulnerability in the shadow MMU emulation of KVM/x86, discovered and reported by [Hyunwoo Kim (@v4bel)](https://x.com/v4bel). By exploiting a role-mismatch in `kvm_mmu_get_child_sp()`, a guest VM can corrupt the host kernel's shadow page state using guest-side actions alone — no host cooperation, no QEMU involvement, and no special hardware. To the best of public knowledge, Januscape is the first guest-to-host KVM escape research that is triggerable on both Intel VMX/EPT and AMD SVM/NPT rather than being limited to a single microarchitecture. The bug lay dormant from its introduction in August 2010 (commit `2032a93d66fa`) until the fix was merged in June 2026 (commit `81ccda30b4e8`) — a window of approximately 16 years.
+Januscape (CVE-2026-53359) is a use-after-free vulnerability in the shadow MMU emulation of KVM/x86, discovered and reported by [Hyunwoo Kim (@v4bel)](https://x.com/v4bel). By exploiting a role-mismatch in `kvm_mmu_get_child_sp()`, a guest VM can corrupt the host kernel's shadow page state using guest-side actions alone — no host cooperation, no QEMU involvement, and no special hardware. To the best of public knowledge, Januscape is the first guest-to-host KVM escape research that is triggerable on both Intel VMX/EPT and AMD SVM/NPT rather than being limited to a single microarchitecture. The bug lay dormant from its introduction in August 2010 (commit `2032a93d66fa`) until the fix was merged on 2026-06-19 (commit `81ccda30b4e8`) — a window of approximately 16 years.
 
 ## What Is Januscape?
 
@@ -55,6 +55,9 @@ ops = amd ? &svm_ops : &vmx_ops;
 The vulnerability was fixed in commit [`81ccda30b4e8`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=81ccda30b4e8), authored by Paolo Bonzini and merged into mainline on 2026-06-19. The patch adds a `role.word` comparison to the reuse condition in `kvm_mmu_get_child_sp()` so that an existing child shadow page is only reused when both the `gfn` **and** the role match:
 
 ```diff
+-	union kvm_mmu_page_role role;
++	union kvm_mmu_page_role role = kvm_mmu_child_role(sptep, direct, access);
+
 -	if (is_shadow_present_pte(*sptep) && !is_large_pte(*sptep) &&
 -	    spte_to_child_sp(*sptep) && spte_to_child_sp(*sptep)->gfn == gfn)
 +	if (is_shadow_present_pte(*sptep) &&
@@ -63,13 +66,16 @@ The vulnerability was fixed in commit [`81ccda30b4e8`](https://git.kernel.org/pu
 +	    spte_to_child_sp(*sptep)->gfn == gfn &&
 +	    spte_to_child_sp(*sptep)->role.word == role.word)
  		return ERR_PTR(-EEXIST);
+
+-	role = kvm_mmu_child_role(sptep, direct, access);
+ 	return kvm_mmu_get_shadow_page(vcpu, gfn, role);
 ```
 
 If the roles differ, the reuse condition does not hold and `kvm_mmu_get_shadow_page()` creates a fresh shadow page of the correct role, eliminating the rmap corruption and UAF path entirely.
 
 ## 16 Years of Dormancy
 
-The vulnerable code path was introduced by commit `2032a93d66fa` on 2010-08-01 as part of the nested virtualization infrastructure added to KVM. It remained undetected for approximately 16 years — across hundreds of kernel releases and countless security audits — until Hyunwoo Kim identified and reported it in June 2026.
+The vulnerable code path was introduced by commit `2032a93d66fa` on 2010-08-01 as part of the nested virtualization infrastructure added to KVM. It remained undetected for approximately 16 years until Hyunwoo Kim identified and reported it in June 2026.
 
 <Note>
   The PoC and technical materials published alongside this write-up are intended solely for security research, education, and defensive purposes. Do not use them on systems you are not authorized to test. Responsible disclosure was carried out through security@kernel.org and the linux-distros mailing list prior to publication.

@@ -100,7 +100,7 @@ The two vulnerabilities are unrelated at the code level — they affect entirely
 
 <Accordion title="Can disabling nested virtualization be used as a workaround?">
 
-Yes, disabling nested virtualization on the host removes the attack surface for Januscape. The shadow MMU path that contains the bug — `kvm_mmu_get_child_sp()` being called via the `ept_page_fault` / `npt_page_fault` handler for nested EPT/NPT — is only reached when a guest is running its own nested guest. If nested virtualization is not exposed to guests, the vulnerable code is unreachable.
+Yes, disabling nested virtualization on the host removes the attack surface for Januscape. The shadow MMU path that contains the bug — `kvm_mmu_get_child_sp()` being called via the `ept_page_fault` handler (and the corresponding AMD nested NPT fetch path) — is only reached when a guest is running its own nested guest. If nested virtualization is not exposed to guests, the vulnerable code is unreachable.
 
 **To disable nested virtualization on Intel:**
 
