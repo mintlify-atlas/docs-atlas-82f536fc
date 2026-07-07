@@ -1,0 +1,71 @@
+---
+title: "Januscape Coordinated Disclosure Timeline"
+sidebarTitle: "Timeline"
+description: "Full disclosure timeline for CVE-2026-53359: from initial report to kernel patch, CVE assignment, embargo end, and public release on oss-security."
+---
+
+Januscape (CVE-2026-53359) was disclosed through coordinated responsible disclosure. After reporting to `security@kernel.org`, the vulnerability was patched in mainline Linux before any public information was released. Once the patch landed, the researcher submitted details and a working exploit to `linux-distros@vs.openwall.org` under a 5-day embargo, giving downstream distribution maintainers time to prepare their own backports. The embargo expired cleanly, and Januscape was published simultaneously on the oss-security mailing list and in this documentation on 2026-07-06 — approximately 24 days after first contact with the kernel security team.
+
+The bug was also exploited as a **0-day** in [Google kvmCTF](https://security.googleblog.com/2024/06/virtual-escape-real-reward-introducing.html) prior to disclosure. Google kvmCTF is a live-kernel capture-the-flag competition running on production GCP infrastructure, where participants attempt to escape a KVM guest and read a flag from the host. Using Januscape in that context validated the full guest-to-host escape primitive against a real cloud environment, not just an isolated lab setup.
+
+An additional historical note: the root-cause commit [2032a93d66fa](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=2032a93d66fa) that introduced the vulnerable `kvm_mmu_get_child_sp()` logic landed on **2010-08-01**, meaning the bug lay dormant for approximately **16 years** before being identified and patched on 2026-06-19.
+
+## Disclosure Steps
+
+<Steps>
+
+### 2026-06-12 — Initial Report to security@kernel.org
+
+Submitted detailed vulnerability information about the shadow-MMU role-mismatch bug, including a full root-cause analysis and a working exploit (kernel-module PoC triggering host panic), to `security@kernel.org`.
+
+### 2026-06-13 — Patch Discussion with KVM Maintainers
+
+Engaged with KVM maintainers **Paolo Bonzini** (Red Hat) and **Sean Christopherson** (Google) to coordinate patch handling. Paolo authored the initial fix: computing `role` before the reuse check and adding the `role.word` comparison to the `kvm_mmu_get_child_sp()` guard.
+
+### 2026-06-17 — Patch Posted to lore.kernel.org
+
+Paolo posted the patch publicly to [lore.kernel.org](https://lore.kernel.org/all/20260617134425.440091-1-pbonzini@redhat.com/) for community review and pre-merge testing, ahead of submitting a formal pull request to Linus Torvalds.
+
+### 2026-06-19 — Patch Merged into Linux Mainline
+
+Commit [`81ccda30b4e8`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=81ccda30b4e8) was merged into Linux mainline, fixing the role-mismatch reuse in `kvm_mmu_get_child_sp()`. All kernel versions including and after this commit are not vulnerable.
+
+### 2026-07-01 — Submitted to linux-distros; 5-Day Embargo Begins
+
+Submitted the vulnerability details and exploit to `linux-distros@vs.openwall.org`. The agreed embargo period was set to **5 days**, giving Linux distribution security teams time to prepare and stage backport patches for their stable kernels before public disclosure.
+
+### 2026-07-04 — CVE-2026-53359 Assigned
+
+**CVE-2026-53359** was formally assigned to Januscape during the embargo window.
+
+### 2026-07-06 — Embargo Ends; Public Disclosure
+
+The embargo expired. Januscape was posted to the **oss-security** mailing list, and this documentation was published. The full write-up, PoC kernel module, and disclosure timeline were released simultaneously.
+
+</Steps>
+
+## Researcher
+
+Januscape was discovered and reported by **Hyunwoo Kim** ([@v4bel](https://x.com/v4bel)). To the best of public knowledge, this is the first guest-to-host KVM exploit demonstrated as triggerable on both **Intel (VMX)** and **AMD (SVM)** platforms, owing to the shared `arch/x86/kvm/mmu/mmu.c` code path where the vulnerability lives.
+
+## Google kvmCTF Context
+
+Januscape was weaponised as a **0-day** in [Google kvmCTF](https://security.googleblog.com/2024/06/virtual-escape-real-reward-introducing.html) before the coordinated disclosure began. kvmCTF runs on live GCP infrastructure: participants are allocated a guest VM and must escape to the host to capture a flag. Achieving a guest-to-host escape in kvmCTF against production cloud hardware confirmed that the full exploit primitive is viable in a real multi-tenant environment, not merely a local lab configuration.
+
+## 16-Year Dormancy
+
+The vulnerable logic in `kvm_mmu_get_child_sp()` — performing the child shadow page reuse check before computing the role, and checking only `gfn` without checking `role` — was introduced by commit [2032a93d66fa](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=2032a93d66fa) on **2010-08-01**. It was patched by `81ccda30b4e8` on **2026-06-19**, giving it a window of approximately 16 years during which any kernel supporting KVM nested virtualisation on x86 was affected.
+
+<Note>
+  **Key links**
+
+  - Patch commit: [81ccda30b4e8](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=81ccda30b4e8)
+  - Patch on lore: [https://lore.kernel.org/all/20260617134425.440091-1-pbonzini@redhat.com/](https://lore.kernel.org/all/20260617134425.440091-1-pbonzini@redhat.com/)
+  - Google kvmCTF announcement: [https://security.googleblog.com/2024/06/virtual-escape-real-reward-introducing.html](https://security.googleblog.com/2024/06/virtual-escape-real-reward-introducing.html)
+</Note>
+
+<Info>
+  **How the linux-distros embargo process works**
+
+  The `linux-distros@vs.openwall.org` list is a private, coordinated disclosure channel for Linux distribution security teams (Red Hat, Debian, Ubuntu, SUSE, Arch, and others). When a reporter submits a vulnerability, they agree on an embargo deadline — typically 7 days or fewer for already-patched issues. During the embargo, distribution maintainers receive the full details and a working exploit so they can prepare, test, and stage backport patches. When the embargo expires, all parties publish simultaneously: the reporter posts to oss-security and distributions release advisories. For Januscape, the mainline patch (`81ccda30b4e8`) had already landed two weeks before the linux-distros submission, so distributions could backport a known-good commit rather than coordinating a patch from scratch.
+</Info>

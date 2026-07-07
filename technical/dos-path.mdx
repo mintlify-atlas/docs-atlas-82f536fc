@@ -1,0 +1,149 @@
+---
+title: "Host Kernel Panic via KVM rmap Corruption (DoS Path)"
+sidebarTitle: "DoS Path"
+description: "Januscape's DoS path triggers a host kernel panic through KVM's own rmap integrity check (KVM_BUG_ON_DATA_CORRUPTION) without needing memory reclamation."
+---
+
+The same role-mismatch reuse that enables the use-after-free write also has a direct and considerably simpler outcome: it causes KVM's own internal data-structure integrity checks to fire, triggering an immediate host kernel panic. No freed memory needs to be reclaimed, no victim object spray is required, and the written value does not matter. The public PoC implements this DoS path exclusively.
+
+<Note>
+This is the path that `poc.c` exercises. The full use-after-free escape described in the [UAF Write](/technical/use-after-free) page requires significantly more exploit engineering. The DoS path is sufficient to bring down every guest on the affected physical host.
+</Note>
+
+## Why the DoS Path Is Simpler
+
+The use-after-free write requires the freed shadow page `spt` to be reclaimed by a suitable victim object before the orphaned parent pointer is cleared — a cross-cache timing attack. The DoS path requires none of this. Instead, it relies on a gfn divergence that is **immediately detectable** by KVM's rmap, and on the fact that `pte_list_remove()` treats such divergence as unrecoverable data corruption.
+
+The two mechanisms share the same trigger: a `direct=1` (direct split) shadow page being reused in a context that expects `direct=0` (indirect). The divergence manifests differently because of how each shadow page type computes the gfn of an installed leaf SPTE.
+
+## gfn Divergence: Install vs. Remove
+
+An **indirect** shadow page (`direct=0`) stores per-slot metadata in `shadowed_translation[]`. When a leaf SPTE is installed, the real guest gfn is written into `sp->shadowed_translation[index]` and used as the rmap key.
+
+A **direct split** shadow page (`direct=1`) has no `shadowed_translation` — the pointer is `NULL`. Instead, it computes the leaf gfn mechanically as `sp->gfn + index`. This is correct when the page was legitimately split from a large page: the large page's base gfn plus the 4KB index gives the leaf gfn.
+
+When a `direct=1` page is reused as `direct=0`, a leaf installed through it is registered in the rmap under the **real** guest gfn (e.g., gfn Q, the probe page). But when that leaf is later removed, the kernel calls `kvm_mmu_page_get_gfn(sp, index)`, which computes `sp->gfn + index` — a completely different value. The rmap lookup uses this computed, wrong key and finds nothing.
+
+## The WARN: kvm_mmu_page_set_translation
+
+The gfn mismatch is first observed — though not fatally — in `kvm_mmu_page_set_translation`:
+
+```c
+static void kvm_mmu_page_set_translation(struct kvm_mmu_page *sp, int index,
+                                         gfn_t gfn, unsigned int access)
+{
+    if (sp->shadowed_translation) {
+        sp->shadowed_translation[index] = (gfn << PAGE_SHIFT) | access;
+        return;
+    }
+    [...]
+    WARN_ONCE(gfn != kvm_mmu_page_get_gfn(sp, index),   // [6]
+              "gfn mismatch under %s page %llx (expected %llx, got %llx)\n",
+              sp->role.passthrough ? "passthrough" : "direct",
+              sp->gfn, kvm_mmu_page_get_gfn(sp, index), gfn);
+}
+```
+
+`[6]` fires when a leaf is installed through the reused `direct=1` page and the caller supplies the real gfn (e.g., Q), but `kvm_mmu_page_get_gfn(sp, index)` returns `sp->gfn + index` (a value derived from the large-page base gfn, not from Q). This `WARN_ONCE` is a **diagnostic indicator only** — it does not prevent the bad install from proceeding. The rmap entry is written under the real gfn key. The leaf's removal will later look under the computed key. The divergence is now committed.
+
+## The Fatal Check: pte_list_remove
+
+The actual crash occurs later, when a second fault overwrites and drops the leaf at the same SPTE slot. The call chain from that fault to the crash is:
+
+```text
+kvm_mmu_page_fault()
+  kvm_mmu_do_page_fault()
+    ept_page_fault()
+      ept_fetch()
+        mmu_set_spte()
+          drop_spte()
+            rmap_remove()
+              pte_list_remove()            // [7]
+                KVM_BUG_ON_DATA_CORRUPTION -> BUG   // [8]
+```
+
+The full `pte_list_remove` function showing the integrity check at `[7]`:
+
+```c
+static void pte_list_remove(struct kvm *kvm, u64 *spte,
+                            struct kvm_rmap_head *rmap_head)
+{
+    struct pte_list_desc *desc;
+    unsigned long rmap_val;
+    int i;
+
+    rmap_val = kvm_rmap_lock(kvm, rmap_head);
+    if (KVM_BUG_ON_DATA_CORRUPTION(!rmap_val, kvm))   // [7]
+        goto out;
+    if (!(rmap_val & KVM_RMAP_MANY)) {
+        if (KVM_BUG_ON_DATA_CORRUPTION((u64 *)rmap_val != spte, kvm))
+            goto out;
+        [...]
+    } else {
+        [...]
+        KVM_BUG_ON_DATA_CORRUPTION(true, kvm);
+    }
+    [...]
+}
+```
+
+`pte_list_remove` is called with the computed-gfn rmap key. Because the leaf was installed under the real gfn key (Q), the computed-gfn rmap bucket is empty — `rmap_val` is zero. The first guard fires: `KVM_BUG_ON_DATA_CORRUPTION(!rmap_val, kvm)`.
+
+## KVM_BUG_ON_DATA_CORRUPTION and the Panic
+
+```c
+#define KVM_BUG_ON_DATA_CORRUPTION(cond, kvm)          \
+({                                                      \
+    bool __ret = !!(cond);                              \
+    if (IS_ENABLED(CONFIG_BUG_ON_DATA_CORRUPTION))      \
+        BUG_ON(__ret);          /* [8] */               \
+    else if (WARN_ON_ONCE(__ret && !(kvm)->vm_bugged))  \
+        kvm_vm_bugged(kvm);                             \
+    unlikely(__ret);                                    \
+})
+```
+
+The behavior at `[8]` depends on kernel configuration:
+
+| Kernel config | `panic_on_oops` | Outcome |
+|---|---|---|
+| `CONFIG_BUG_ON_DATA_CORRUPTION=y` | any | `BUG_ON` → immediate host kernel panic |
+| `CONFIG_BUG_ON_DATA_CORRUPTION=n` | — | `WARN_ON_ONCE` + `kvm_vm_bugged()` — guest VM is killed, host survives |
+
+<Warning>
+`CONFIG_BUG_ON_DATA_CORRUPTION=y` is the **default in RHEL** and many other enterprise distributions. Combined with the default `panic_on_oops=1`, a single successful race triggers an immediate, unrecoverable host kernel panic. Every guest on the physical host is simultaneously brought down.
+</Warning>
+
+## Observed Panic Log
+
+The following panic was triggered on RHEL (`6.12.0-211.26.1.el10_2.x86_64`) using the public PoC:
+
+```text
+gfn mismatch under direct page 8a00 (expected 8b00, got 256e4)
+WARNING: CPU: 6 PID: 974281 at arch/x86/kvm/mmu/mmu.c:689 kvm_mmu_page_set_translation.part.0+0xb7/0x130 [kvm]
+CPU: 6 PID: 974281 Comm: qemu-kvm  6.12.0-211.26.1.el10_2.x86_64
+kernel BUG at arch/x86/kvm/mmu/mmu.c:1091!
+RIP: 0010:pte_list_remove.isra.0+0xd9/0xe0 [kvm]
+CPU: 3 PID: 974278 Comm: qemu-kvm
+```
+
+The sequence is visible in the log:
+
+1. `WARNING` at `mmu.c:689` — the `WARN_ONCE` at `[6]` in `kvm_mmu_page_set_translation` fires first, reporting the gfn mismatch between the expected value (`8b00`) and the real leaf gfn (`256e4`).
+2. `kernel BUG at mmu.c:1091` — `pte_list_remove` hits `BUG_ON` at `[8]` when the rmap lookup under the computed gfn key returns empty.
+
+The two events occur on different CPUs (`CPU: 6` and `CPU: 3`) and different PIDs (`974281` and `974278`), which is consistent with the multi-vCPU race: the install and the drop happen on separate faulter threads racing over `mmu_lock`.
+
+## PoC Invocation
+
+The public PoC is a kernel module loaded inside the guest VM. It requires nested virtualization to be exposed to the guest, and the in-tree KVM module must be unloaded first because the PoC uses raw VMX/SVM instructions directly:
+
+```bash
+# Intel
+sudo rmmod kvm_intel; sudo insmod poc.ko
+
+# AMD
+sudo rmmod kvm_amd; sudo insmod poc.ko amd=1
+```
+
+The module launches one writer kthread and up to seven faulter kthreads (configurable via `nvcpu=`). The writer toggles `nest_pd[PDE_IDX]` between a huge-page PTE and a table PTE. The faulters continuously run L2, generating faults that drive the shadow MMU fetch path. The race window opens between the PDE write and the subsequent `kvm_page_track_write` zap on L0. With the default `dwell=256` spin count, the module reports progress periodically and the panic typically occurs within seconds to minutes on a vulnerable host.

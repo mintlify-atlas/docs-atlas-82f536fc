@@ -1,0 +1,117 @@
+---
+title: "Patch Analysis: Fixing the Role-Mismatch in kvm_mmu_get_child_sp"
+sidebarTitle: "The Fix"
+description: "Commit 81ccda30b4e8 adds a role.word comparison to kvm_mmu_get_child_sp, ensuring shadow pages are reused only when both gfn and role match."
+---
+
+Commit `81ccda30b4e8`, authored by Paolo Bonzini (Red Hat / KVM maintainer) and merged into Linux mainline on **2026-06-19**, closes Januscape (CVE-2026-53359) with a targeted, minimal change to `kvm_mmu_get_child_sp()` in `arch/x86/kvm/mmu/mmu.c`. The fix restores the rmap invariant — that install and teardown of a leaf SPTE always use the same gfn key — by ensuring a child shadow page is reused only when **both** its `gfn` and its `role` match the request. Before the fix, a gfn match alone was sufficient, which allowed a direct-split shadow page (`role.direct=1`) to be silently reused as an indirect shadow page (`role.direct=0`) for the same gfn, corrupting the rmap and opening the use-after-free write path described in the root-cause analysis.
+
+## Upstream Patch
+
+| Field | Value |
+|---|---|
+| Commit | `81ccda30b4e8` |
+| Author | Paolo Bonzini `<pbonzini@redhat.com>` (Red Hat / KVM maintainer) |
+| Merged | 2026-06-19 (Linux mainline) |
+| File | `arch/x86/kvm/mmu/mmu.c` |
+
+```diff
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 9368a71336fe4..c13b80fe3125b 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -2459,13 +2459,15 @@ static struct kvm_mmu_page *kvm_mmu_get_child_sp(struct kvm_vcpu *vcpu,
+ 						 u64 *sptep, gfn_t gfn,
+ 						 bool direct, unsigned int access)
+ {
+-	union kvm_mmu_page_role role;
++	union kvm_mmu_page_role role = kvm_mmu_child_role(sptep, direct, access);
+ 
+-	if (is_shadow_present_pte(*sptep) && !is_large_pte(*sptep) &&
+-	    spte_to_child_sp(*sptep) && spte_to_child_sp(*sptep)->gfn == gfn)
++	if (is_shadow_present_pte(*sptep) &&
++	    !is_large_pte(*sptep) &&
++	    spte_to_child_sp(*sptep) &&
++	    spte_to_child_sp(*sptep)->gfn == gfn &&
++	    spte_to_child_sp(*sptep)->role.word == role.word)
+ 		return ERR_PTR(-EEXIST);
+ 
+-	role = kvm_mmu_child_role(sptep, direct, access);
+ 	return kvm_mmu_get_shadow_page(vcpu, gfn, role);
+ }
+```
+
+<Note>
+  The patch was posted to lore.kernel.org for review and testing prior to the pull request:
+  [https://lore.kernel.org/all/20260617134425.440091-1-pbonzini@redhat.com/](https://lore.kernel.org/all/20260617134425.440091-1-pbonzini@redhat.com/)
+</Note>
+
+## What Changed
+
+The diff is small — four added lines and three removed — but each change is load-bearing.
+
+**1. `role` is computed before the reuse check (was computed after)**
+
+In the vulnerable code, `role` was declared uninitialised and only assigned by `kvm_mmu_child_role()` *after* the reuse guard. This meant the guard could never compare the role, because it had not been calculated yet. The fix moves the initialisation to the declaration site:
+
+```c
+union kvm_mmu_page_role role = kvm_mmu_child_role(sptep, direct, access);
+```
+
+`role` is now fully populated before the `if` block is entered.
+
+**2. `role.word` comparison added to the reuse condition**
+
+The new condition reads:
+
+```c
+spte_to_child_sp(*sptep)->role.word == role.word
+```
+
+`union kvm_mmu_page_role` packs all shadow-page metadata — including `direct`, `level`, `access`, `gpte_is_8_bytes`, and several other bitfields — into a single `u32`. Comparing `role.word` as a 32-bit integer is therefore an atomic, complete role equality check. A shadow page is returned as `-EEXIST` (reused) **only** when both the gfn and the full role word match the incoming request.
+
+**3. Role mismatch → no reuse → correct shadow page created**
+
+When the role differs (e.g., an existing direct-split page `direct=1` is present but the caller needs an indirect page `direct=0`), the condition evaluates to `false`. Execution falls through to:
+
+```c
+return kvm_mmu_get_shadow_page(vcpu, gfn, role);
+```
+
+`kvm_mmu_get_shadow_page` looks up or allocates a shadow page with the *correct* role, so the fetch path installs a properly-typed shadow page rather than silently reusing a mismatched one.
+
+## Why This Fix Is Correct
+
+The rmap invariant requires that the gfn key used when installing a leaf SPTE is the same key used when tearing that leaf down. Before the patch, the shadow MMU could link an indirect shadow page's leaf SPTE under the real guest gfn (e.g., gfn Q from the probe page), yet later resolve the teardown gfn through the direct-split assumption (`sp->gfn + index`), producing a different key. The lookup at teardown finds an empty rmap bucket and the kernel's own `pte_list_remove` integrity check fires `KVM_BUG_ON_DATA_CORRUPTION`.
+
+By gating reuse on a full role match, the patch prevents a direct-split page from ever being substituted for an indirect page (or vice versa). The install path and the teardown path therefore always operate on a shadow page whose role matches the current walk, keeping the gfn keys consistent throughout the lifetime of every leaf SPTE.
+
+## What This Eliminates
+
+<CardGroup cols={3}>
+  <Card title="rmap Corruption" icon="bug">
+    The diverging gfn keys that cause `pte_list_remove` to miss its target entry can no longer occur.
+  </Card>
+  <Card title="Use-After-Free Write" icon="triangle-exclamation">
+    The orphaned parent pointer that writes `SHADOW_NONPRESENT_VALUE` (`0x8000000000000000`) into a reoccupied victim page is eliminated at the root.
+  </Card>
+  <Card title="KVM_BUG_ON_DATA_CORRUPTION Panic" icon="skull">
+    The host kernel panic triggered by `CONFIG_BUG_ON_DATA_CORRUPTION=y` + `panic_on_oops` is no longer reachable from a guest.
+  </Card>
+</CardGroup>
+
+## Patching Guidance
+
+Apply commit `81ccda30b4e8` to your host kernel, or upgrade to a kernel version that already includes it (merged 2026-06-19). To verify that a running kernel contains the fix, check the kernel commit log or inspect the build configuration:
+
+```bash
+# Check whether the commit is present in the running kernel's source tree
+grep -r "81ccda30b4e8" /boot/config-$(uname -r) 2>/dev/null || \
+  git -C /usr/src/linux log --oneline | grep 81ccda30b4e8
+```
+
+Distribution kernels (RHEL, Debian, Ubuntu, SUSE) that backport the fix will include `81ccda30b4e8` in their changelog or patch series. Confirm with your distro's security advisory tracker.
+
+<Tip>
+  If patching the host kernel is not immediately possible, disabling nested virtualization exposure to untrusted guests is an effective temporary workaround. On KVM/Intel, set `kvm-intel.nested=0`; on KVM/AMD, set `kvm-amd.nested=0`. This prevents L1 guests from running nested guests (L2), which is the prerequisite for reaching the shadow-MMU fetch path where the bug fires. Remove the mitigation once the patched kernel is deployed.
+</Tip>

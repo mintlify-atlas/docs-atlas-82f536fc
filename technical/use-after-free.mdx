@@ -1,0 +1,103 @@
+---
+title: "Use-After-Free Write Primitive in KVM Shadow MMU"
+sidebarTitle: "UAF Write"
+description: "Role confusion in Januscape breaks shadow page lifetime accounting, creating a use-after-free where a freed shadow page's backing memory receives a fixed constant write."
+---
+
+When the role-mismatch reuse described in the root cause fires, the shadow MMU begins using a `direct=1` shadow page as if it were `direct=0`. This confusion does not immediately crash the kernel — it propagates silently through parent pointer accounting until the shadow page is eventually zapped. At that point, the cleanup path writes a fixed constant into a memory location that may have already been freed and reallocated as a different kernel object. This is the Januscape use-after-free write primitive.
+
+<Note>
+This page covers the full use-after-free path that underlies the complete guest-to-host escape. For the simpler DoS path that relies on KVM's own rmap integrity check — which requires neither memory reclamation nor value control — see the [DoS Path](/technical/dos-path) page. The public PoC implements the DoS path, not this one.
+</Note>
+
+## How Role Confusion Breaks Shadow Page Lifetime
+
+A `struct kvm_mmu_page` is reference-counted through its parent SPTE links. When a shadow page `sp` is installed as a child of a parent shadow page `parent_sp`, a pointer from the parent's SPTE slot back to `sp` is tracked in `sp->parent_ptes`. When `sp` is zapped, the kernel walks `sp->parent_ptes` and clears every parent SPTE that points to it.
+
+Role confusion corrupts this accounting in two ways:
+
+1. **Wrong shadow page is kept alive.** The `direct=1` page is referenced via the parent SPTE that should be pointing to a `direct=0` page. The `direct=0` page that should have been installed is either not created or its reference count is skewed.
+2. **Orphaned parent pointer.** When the `direct=1` page is eventually zapped and freed, the parent SPTE in another shadow page still holds a raw pointer into the now-freed page's memory. This is the orphaned parent pointer that enables the subsequent write.
+
+At this point the `direct=1` shadow page's backing `spt` memory — a 4KB page that held 512 SPTEs — has been returned to the buddy allocator and may be claimed by any kernel subsystem.
+
+## The UAF Write Path
+
+When the shadow MMU later cleans up the structure containing the orphaned parent pointer, it calls into the zap path for the parent shadow page:
+
+```text
+__kvm_mmu_prepare_zap_page()
+  kvm_mmu_unlink_parents()
+    drop_parent_pte()
+      mmu_spte_clear_no_track(sptep)   // [4]
+        __update_clear_spte_fast()
+          WRITE_ONCE(*sptep, SHADOW_NONPRESENT_VALUE)   // [5]
+```
+
+The full C code for the two innermost functions:
+
+```c
+static void drop_parent_pte(struct kvm *kvm, struct kvm_mmu_page *sp,
+                            u64 *parent_pte)
+{
+    mmu_page_remove_parent_pte(kvm, sp, parent_pte);
+    mmu_spte_clear_no_track(parent_pte);   // [4]
+}
+
+static void mmu_spte_clear_no_track(u64 *sptep)
+{
+    __update_clear_spte_fast(sptep, SHADOW_NONPRESENT_VALUE);   // [5]
+}
+```
+
+At `[4]`, the kernel believes it is writing the "non-present" sentinel value into one slot of a shadow page that it owns. But `sptep` points into the `spt` backing page of a shadow page that has **already been freed**. If that page has since been reclaimed by a different kernel subsystem (the victim object), `WRITE_ONCE` at `[5]` writes directly into that victim's memory.
+
+## The Written Value
+
+The constant written is `SHADOW_NONPRESENT_VALUE`, defined as:
+
+```c
+#ifdef CONFIG_X86_64
+#define SHADOW_NONPRESENT_VALUE  BIT_ULL(63)   // 0x8000000000000000
+#else
+#define SHADOW_NONPRESENT_VALUE  0ULL
+#endif
+```
+
+On x86-64 hosts — the only relevant target — this is `0x8000000000000000`. The bit layout is architecturally significant: bit 63 of an x86 PTE is the NX (no-execute) bit when EFER.NXE is set, and it is also used as a KVM sentinel for non-present shadow PTEs. As a 64-bit value to corrupt kernel heap memory, it is a large, non-zero constant with a single bit set.
+
+## What the Attacker Controls
+
+The guest controls **one dimension** of this write:
+
+| Dimension | Guest control |
+|---|---|
+| Written value | **Fixed:** `0x8000000000000000` on x86-64 |
+| Target page | Determined by which shadow page is freed (limited influence) |
+| Target offset within page | **Chosen:** which slot (0–511) within the 4KB `spt` page receives the write, controlled by the index of the orphaned parent SPTE |
+
+The attacker has no direct control over the written value and cannot make it point to controlled memory or encode a useful kernel pointer. The slot offset within the freed page is the attacker's lever.
+
+## Cross-Cache Attack Requirements
+
+For the UAF write to reach a useful victim object, the freed `spt` page must be reclaimed by a slab cache that allocates objects covering the target slot offset. Because `spt` is a full 4KB page allocated directly from the page allocator (not a slab), the attacker must execute a **cross-cache attack**: arrange for the right slab cache to refill from the page allocator and claim the specific page that was freed.
+
+This requires careful object selection based on:
+
+1. **Fixed-value alignment:** The 8 bytes at the chosen slot offset in the victim object must be a field where `0x8000000000000000` is a meaningful corruption. On x86-64, this could be a pointer field (clearing the lower bits effectively nulls it if bit 63 is masked), a flag word, a length field, or a refcount — depending on the target structure.
+2. **Allocation timing:** The victim objects must be sprayed after the `spt` page is freed, so that one of them lands on the freed page.
+3. **Architecture dependence:** Because `SHADOW_NONPRESENT_VALUE` is `0` on 32-bit x86, the primitive only carries significance on x86-64. The AMD and Intel paths differ in the shadow page geometry that reaches the UAF, so each architecture requires its own exploitation strategy.
+
+<Tip>
+Empirically, the AMD-specific full escape is somewhat easier to develop than the Intel path. The AMD NPT shadow geometry produces a cross-cache scenario where the `0x8000000000000000` value aligns more readily to a field in a practical victim object. Both paths use the same underlying bug.
+</Tip>
+
+## Primitive Summary
+
+This is a constrained write-what-where primitive with the following properties:
+
+- **Write value:** `0x8000000000000000` (fixed, architecture-dependent)
+- **Write width:** 8 bytes (`u64`)
+- **Target:** One 8-byte slot within a 4KB page that was formerly a KVM shadow page `spt`, after it has been reclaimed by a victim kernel object
+- **Repeatability:** The bug can be triggered multiple times before the host is destabilized, allowing spray-and-pray slot selection
+- **Kernel version dependency:** Exploitation strategy varies by kernel version due to slab layout and object field offsets

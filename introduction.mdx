@@ -1,0 +1,93 @@
+---
+title: "Januscape: KVM Guest-to-Host Escape Vulnerability"
+sidebarTitle: "Introduction"
+description: "Januscape (CVE-2026-53359) is a use-after-free in KVM/x86 shadow MMU allowing a guest VM to panic or escape to the host on Intel and AMD."
+---
+
+Januscape (CVE-2026-53359) is a use-after-free vulnerability in the shadow MMU emulation of KVM/x86, discovered and reported by [Hyunwoo Kim (@v4bel)](https://x.com/v4bel). By exploiting a role-mismatch in `kvm_mmu_get_child_sp()`, a guest VM can corrupt the host kernel's shadow page state using guest-side actions alone — no host cooperation, no QEMU involvement, and no special hardware. To the best of public knowledge, Januscape is the first guest-to-host KVM escape research that is triggerable on both Intel VMX/EPT and AMD SVM/NPT rather than being limited to a single microarchitecture. The bug lay dormant from its introduction in August 2010 (commit `2032a93d66fa`) until the fix was merged in June 2026 (commit `81ccda30b4e8`) — a window of approximately 16 years.
+
+## What Is Januscape?
+
+The Linux KVM shadow MMU maintains *shadow pages* (`struct kvm_mmu_page`) that mirror guest page tables in software. The function `kvm_mmu_get_child_sp()` is responsible for finding or creating a child shadow page when the shadow MMU walks a guest page table tree. Before the fix, the early-return reuse check at the top of `kvm_mmu_get_child_sp()` compared only the `gfn` (guest frame number) of the child shadow page already linked at a given slot, and ignored the page's *role* — a bitfield that records, among other things, whether the page is a **direct split** (`role.direct=1`, created when KVM splits a 2 MB large page into 4 KB entries) or an **indirect shadow** (`role.direct=0`, created when KVM shadows a guest-controlled page table).
+
+When the shadow MMU fetch path needs two children of different roles for the same `gfn` — which arises naturally when the same physical page is simultaneously the leaf of a large-page mapping and a nested page table page — the incomplete `gfn`-only check causes the wrong-role page to be returned as `-EEXIST`. The reused page is then referenced with the wrong role, breaking rmap accounting and lifetime tracking. This ultimately produces a state in which one shadow page has been freed while another still holds a pointer into it — a classic use-after-free.
+
+## Why It Matters
+
+Januscape lives entirely in in-kernel KVM (`arch/x86/kvm/mmu/mmu.c`). Because the fault handling for nested EPT/NPT shadowing never leaves the kernel, the vulnerability is **independent of QEMU** and threatens any VMM stack running on top of x86 KVM — including the custom hypervisor stacks deployed by large public clouds such as GCP and AWS.
+
+The vulnerability is triggered through nested virtualization: when the guest (L1) runs its own nested guest (L2) with EPT or NPT, the host (L0) must shadow L1's nested page tables in software via the legacy shadow MMU, even on hosts with `kvm-intel.ept=1` and `tdp_mmu=Y`, because the nested-EPT MMU root is non-direct. This means the bug path is reachable on any x86 KVM host that exposes nested virtualization to untrusted tenants.
+
+Januscape was successfully used as a **0-day exploit** in [Google kvmCTF](https://security.googleblog.com/2024/06/virtual-escape-real-reward-introducing.html), demonstrating real-world exploitability against hardened cloud infrastructure.
+
+## Impact
+
+Januscape carries two distinct impacts:
+
+**1. KVM Escape (DoS or RCE)**
+
+With guest-side actions alone, an attacker who has been allocated a single cloud instance can:
+
+- **DoS** — Trigger a host kernel panic via `KVM_BUG_ON_DATA_CORRUPTION` in `pte_list_remove()`, taking down every co-tenant VM on the same physical machine. This path requires no heap grooming and fires even without the freed page being reclaimed by a victim object.
+- **RCE** — Leverage the use-after-free write primitive to corrupt a carefully chosen kernel object and execute arbitrary code with root privilege on the host, gaining control over the host and all guests running on it. The write is a single fixed constant (`0x8000000000000000` on x86-64, `SHADOW_NONPRESENT_VALUE`) to a guest-controlled offset within the freed page; this constraint makes full RCE significantly more involved than the DoS, and a full escape exploit is not released at this time.
+
+**2. Local Privilege Escalation**
+
+On distributions such as RHEL where `/dev/kvm` is world-writable (`0666`), an unprivileged local user can access KVM directly and use Januscape as a reliable LPE to gain root on the host, without any cloud context required.
+
+## Intel and AMD — Both Affected
+
+Because the vulnerable function `kvm_mmu_get_child_sp()` resides in the x86-common shadow MMU code shared by both the VMX and SVM backends, the exploit works on Intel hosts (VMX/EPT) and AMD hosts (SVM/NPT) alike. The public PoC implements a `virt_ops` abstraction that swaps only the architecture-specific page-table entry bits at runtime:
+
+```c
+// Intel EPT large-page entry
+static u64 vmx_huge_pte(u64 pa) { return pa | EPT_LEAF | EPT_PS; }
+
+// AMD NPT large-page entry
+static u64 svm_huge_pte(u64 pa) { return pa | PF_P | PF_RW | PF_US | PF_PS; }
+
+// Selected at module load time
+ops = amd ? &svm_ops : &vmx_ops;
+```
+
+## The Fix
+
+The vulnerability was fixed in commit [`81ccda30b4e8`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=81ccda30b4e8), authored by Paolo Bonzini and merged into mainline on 2026-06-19. The patch adds a `role.word` comparison to the reuse condition in `kvm_mmu_get_child_sp()` so that an existing child shadow page is only reused when both the `gfn` **and** the role match:
+
+```diff
+-	if (is_shadow_present_pte(*sptep) && !is_large_pte(*sptep) &&
+-	    spte_to_child_sp(*sptep) && spte_to_child_sp(*sptep)->gfn == gfn)
++	if (is_shadow_present_pte(*sptep) &&
++	    !is_large_pte(*sptep) &&
++	    spte_to_child_sp(*sptep) &&
++	    spte_to_child_sp(*sptep)->gfn == gfn &&
++	    spte_to_child_sp(*sptep)->role.word == role.word)
+ 		return ERR_PTR(-EEXIST);
+```
+
+If the roles differ, the reuse condition does not hold and `kvm_mmu_get_shadow_page()` creates a fresh shadow page of the correct role, eliminating the rmap corruption and UAF path entirely.
+
+## 16 Years of Dormancy
+
+The vulnerable code path was introduced by commit `2032a93d66fa` on 2010-08-01 as part of the nested virtualization infrastructure added to KVM. It remained undetected for approximately 16 years — across hundreds of kernel releases and countless security audits — until Hyunwoo Kim identified and reported it in June 2026.
+
+<Note>
+  The PoC and technical materials published alongside this write-up are intended solely for security research, education, and defensive purposes. Do not use them on systems you are not authorized to test. Responsible disclosure was carried out through security@kernel.org and the linux-distros mailing list prior to publication.
+</Note>
+
+## Explore Further
+
+<CardGroup cols={2}>
+  <Card title="Background" icon="book" href="/technical/background">
+    KVM shadow MMU internals, nested virtualization, and the rmap data structure that Januscape corrupts.
+  </Card>
+  <Card title="Root Cause" icon="magnifying-glass" href="/technical/root-cause">
+    Deep-dive into the role-mismatch reuse bug in `kvm_mmu_get_child_sp()`, the UAF write primitive, and the DoS path through `pte_list_remove()`.
+  </Card>
+  <Card title="PoC Usage" icon="terminal" href="/poc/usage">
+    How to build, load, and run the kernel module PoC inside a guest VM on both Intel and AMD hosts.
+  </Card>
+  <Card title="Patch Analysis" icon="shield-check" href="/patch/fix">
+    Line-by-line analysis of the `81ccda30b4e8` fix and why the added `role.word` check closes the vulnerability completely.
+  </Card>
+</CardGroup>

@@ -1,0 +1,98 @@
+---
+title: "Affected Linux Kernel Versions for CVE-2026-53359"
+sidebarTitle: "Affected Versions"
+description: "CVE-2026-53359 affects Linux kernels from commit 2032a93d66fa (2010) through 81ccda30b4e8 (2026). Check and apply the patch immediately."
+---
+
+CVE-2026-53359 (Januscape) affects every Linux kernel that contains the vulnerable `kvm_mmu_get_child_sp()` code path but does not yet include the fix. The vulnerable code was introduced on 2010-08-01 and the fix was merged into Linus's tree on 2026-06-19, placing the affected window at approximately **16 years** of production kernels. If your x86 KVM host accepts untrusted guests and exposes nested virtualization, you should verify patch status immediately.
+
+<Warning>
+  If you operate an x86 KVM host that runs multi-tenant workloads with nested virtualization enabled, assume you are affected until you have confirmed that commit `81ccda30b4e8` is present in your running kernel. A single untrusted guest tenant with root on their own VM can panic your host — taking down every other tenant on the same physical machine — or, with more effort, execute code as root on the host itself.
+</Warning>
+
+## Commit Range
+
+| Boundary | Commit | Date | Description |
+|---|---|---|---|
+| **Introduced** | [`2032a93d66fa`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=2032a93d66fa) | 2010-08-01 | Nested virtualization infrastructure added `kvm_mmu_get_child_sp()` without a role check |
+| **Fixed** | [`81ccda30b4e8`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=81ccda30b4e8) | 2026-06-16 (authored) · 2026-06-19 (merged) | Added `role.word` comparison to the child SP reuse condition |
+
+Every mainline kernel in the range **v2.6.36 through the commit immediately preceding `81ccda30b4e8`** is vulnerable. This includes all stable and longterm branches that backport the nested KVM shadow MMU code but have not yet received the fix backport.
+
+## How to Check Whether Your Kernel Is Patched
+
+### Method 1 — Check for the fix commit directly
+
+On the host kernel:
+
+```bash
+# Check whether the fix commit is reachable from your running kernel's build tree
+grep -r "role.word" /usr/src/linux-$(uname -r)/arch/x86/kvm/mmu/mmu.c 2>/dev/null
+```
+
+If the output contains `spte_to_child_sp(*sptep)->role.word == role.word`, the patch is present.
+
+### Method 2 — Inspect the running kernel config and version
+
+```bash
+# Print the full kernel version string
+uname -r
+
+# Check the build date of the running kernel
+uname -v
+```
+
+Kernels built from source after 2026-06-19 from a tree that includes `81ccda30b4e8` are patched. Distribution kernels require checking vendor-specific errata and changelog entries for the CVE number `CVE-2026-53359`.
+
+### Method 3 — Check distribution package changelogs
+
+For RHEL / CentOS Stream / Rocky Linux / AlmaLinux:
+
+```bash
+rpm -q --changelog kernel | grep -i "CVE-2026-53359\|81ccda30b4e8"
+```
+
+For Debian / Ubuntu:
+
+```bash
+apt-get changelog linux-image-$(uname -r) 2>/dev/null | grep -i "CVE-2026-53359\|81ccda30b4e8"
+```
+
+## Who Is at Risk
+
+### Affected — Patch Immediately
+
+| Scenario | Risk | Notes |
+|---|---|---|
+| x86 KVM hosts accepting untrusted guests **with** nested virtualization exposed | **Critical** | DoS (host panic) or RCE reachable from inside guest |
+| Multi-tenant public cloud x86 KVM stacks (GCP, AWS, etc.) | **Critical** | Guest tenant can panic host or escape to host |
+| RHEL and similar distros with world-writable `/dev/kvm` (`0666`) | **Critical + LPE** | Unprivileged local user gains root via KVM without needing guest root |
+| Any x86 KVM host on a kernel in the range `2032a93d66fa` → pre-`81ccda30b4e8` | **High** | Vulnerable even if nested virt not currently in use by tenants, if it is exposed |
+
+### Not Affected — But Verify Your Posture
+
+| Scenario | Status | Notes |
+|---|---|---|
+| Kernels containing commit `81ccda30b4e8` | ✅ Patched | Reuse condition now checks both `gfn` and `role.word` |
+| **arm64 KVM hosts** | ✅ Not affected by this bug | The vulnerable code is x86-specific; see ITScape (CVE-2026-46316) for a separate arm64 KVM issue by the same researcher |
+| x86 KVM hosts with **nested virtualization disabled** | ⚠️ Attack surface removed | Disabling nested virt prevents the shadow MMU path from being reached, but patching is strongly preferred over relying on configuration |
+| Bare-metal x86 machines that do not run KVM at all | ✅ Not affected | No KVM = no shadow MMU = not reachable |
+| x86 KVM hosts running only **fully trusted, single-tenant guests** | Low risk | Not a realistic attack vector in practice, but still advisable to patch |
+
+## Vendor and Distribution Status
+
+Distribution vendors began backporting the fix after the embargo ended on 2026-07-06. Check your vendor's security advisory tracker for the status of `CVE-2026-53359` on your specific kernel version and release stream. The upstream fix commit `81ccda30b4e8` is the definitive reference for all backport verification.
+
+<Note>
+  If nested virtualization cannot be disabled and your vendor's patched kernel is not yet available, consider migrating time-sensitive workloads off the affected KVM host or restricting the ability of guest tenants to load kernel modules as a temporary risk-reduction measure. These are mitigations only — they do not fix the underlying vulnerability. Apply the patch as soon as it is available for your distribution.
+</Note>
+
+## Disclosure Timeline Reference
+
+- **2026-06-12** — Vulnerability and exploit submitted to `security@kernel.org` by Hyunwoo Kim
+- **2026-06-13** — KVM maintainers Paolo Bonzini and Sean Christopherson engaged; Paolo authored the patch
+- **2026-06-17** — Patch posted to [lore.kernel.org](https://lore.kernel.org/all/20260617134425.440091-1-pbonzini@redhat.com/) for pre-merge testing
+- **2026-06-19** — `81ccda30b4e8` merged into Linus's mainline tree
+- **2026-07-01** — Submitted to `linux-distros@vs.openwall.org`; 5-day embargo set
+- **2026-07-04** — CVE-2026-53359 assigned
+- **2026-07-06** — Embargo ended; posted to `oss-security`; full write-up and PoC published
